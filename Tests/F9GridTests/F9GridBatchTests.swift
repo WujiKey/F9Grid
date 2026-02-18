@@ -7,7 +7,6 @@
 //
 
 import XCTest
-import TOMLDecoder
 @testable import F9Grid
 
 class F9GridBatchTests: XCTestCase {
@@ -180,40 +179,6 @@ class F9GridBatchTests: XCTestCase {
 
     // MARK: - Helper Types
 
-    /// TOML file structure for decoding
-    private struct TOMLTestFile: Decodable {
-        let test: [[TOMLValue]]
-    }
-
-    /// TOML value that can be string or integer
-    private enum TOMLValue: Decodable {
-        case string(String)
-        case int(Int64)
-
-        init(from decoder: Decoder) throws {
-            let container = try decoder.singleValueContainer()
-            if let intValue = try? container.decode(Int64.self) {
-                self = .int(intValue)
-            } else if let stringValue = try? container.decode(String.self) {
-                self = .string(stringValue)
-            } else {
-                throw DecodingError.typeMismatch(TOMLValue.self,
-                    DecodingError.Context(codingPath: decoder.codingPath,
-                                          debugDescription: "Expected String or Int64"))
-            }
-        }
-
-        var stringValue: String? {
-            if case .string(let s) = self { return s }
-            return nil
-        }
-
-        var intValue: Int64? {
-            if case .int(let i) = self { return i }
-            return nil
-        }
-    }
-
     private struct TestCase {
         let line: Int
         let lat: String
@@ -229,7 +194,7 @@ class F9GridBatchTests: XCTestCase {
 
     private func loadTestCases() throws -> [TestCase] {
         let content = try loadFile(name: "f9grid_test", ext: "toml")
-        return try parseTOML(content)
+        return try parseTestTOML(content)
     }
 
     private func loadFile(name: String, ext: String) throws -> String {
@@ -258,36 +223,68 @@ class F9GridBatchTests: XCTestCase {
         throw TestFileError.fileNotFound
     }
 
-    // MARK: - TOML Parser using TOMLDecoder
+    // MARK: - Minimal TOML Parser (no external dependencies)
+    //
+    // Supports the specific subset used by f9grid_test.toml:
+    //   test = [
+    //       ["str", "str", int, int, int],  # optional inline comment
+    //       # full-line comment
+    //   ]
 
-    private func parseTOML(_ content: String) throws -> [TestCase] {
-        let decoder = TOMLDecoder()
-        let tomlFile = try decoder.decode(TOMLTestFile.self, from: content)
-
-        // Build line number mapping by searching for each test case in the original content
+    private func parseTestTOML(_ content: String) throws -> [TestCase] {
         let lines = content.components(separatedBy: .newlines)
         var testCases: [TestCase] = []
+        var insideArray = false
 
-        for (index, row) in tomlFile.test.enumerated() {
-            guard row.count == 5,
-                  let lat = row[0].stringValue,
-                  let lng = row[1].stringValue,
-                  let expectedIndex = row[2].intValue,
-                  let expectedK = row[3].intValue,
-                  let expectedPositionCode = row[4].intValue,
-                  let latDecimal = Decimal(string: lat),
-                  let lngDecimal = Decimal(string: lng) else {
-                throw TestFileError.parseError(line: index + 1)
+        for (lineIndex, rawLine) in lines.enumerated() {
+            let lineNumber = lineIndex + 1
+
+            // Strip inline comment: find first '#' that is not inside a quoted string
+            let stripped = stripTOMLComment(rawLine).trimmingCharacters(in: .whitespaces)
+
+            if stripped.isEmpty { continue }
+
+            if !insideArray {
+                // Detect start of the test array
+                if stripped.hasPrefix("test") && stripped.contains("[") {
+                    insideArray = true
+                }
+                continue
             }
 
-            // Find the actual line number by searching for this test case pattern
-            let searchPattern = "\"\(lat)\", \"\(lng)\""
-            var lineNumber = index + 1  // fallback to array index
-            for (lineIndex, line) in lines.enumerated() {
-                if line.contains(searchPattern) && line.contains(String(expectedIndex)) {
-                    lineNumber = lineIndex + 1  // 1-based line number
-                    break
-                }
+            // Detect end of the test array
+            if stripped == "]" { break }
+
+            // Skip lines that don't start a data row
+            guard stripped.hasPrefix("[") else { continue }
+
+            // Parse ["lat", "lng", index, k, positionCode]
+            // Remove surrounding brackets and optional trailing comma
+            var inner = stripped
+            if inner.hasSuffix(",") { inner.removeLast() }
+            guard inner.hasPrefix("[") && inner.hasSuffix("]") else {
+                throw TestFileError.parseError(line: lineNumber)
+            }
+            inner = String(inner.dropFirst().dropLast())
+
+            // Split on commas, respecting quoted strings
+            let parts = splitTOMLRow(inner)
+            guard parts.count == 5 else {
+                throw TestFileError.parseError(line: lineNumber)
+            }
+
+            let lat = parts[0].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            let lng = parts[1].trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            let indexStr = parts[2].trimmingCharacters(in: .whitespaces)
+            let kStr    = parts[3].trimmingCharacters(in: .whitespaces)
+            let posStr  = parts[4].trimmingCharacters(in: .whitespaces)
+
+            guard let expectedIndex = Int64(indexStr),
+                  let expectedK = Int64(kStr),
+                  let expectedPositionCode = Int64(posStr),
+                  let latDecimal = Decimal(string: lat),
+                  let lngDecimal = Decimal(string: lng) else {
+                throw TestFileError.parseError(line: lineNumber)
             }
 
             testCases.append(TestCase(
@@ -303,6 +300,36 @@ class F9GridBatchTests: XCTestCase {
         }
 
         return testCases
+    }
+
+    /// Strips a TOML comment (everything from the first '#' not inside a quoted string).
+    private func stripTOMLComment(_ line: String) -> String {
+        var inString = false
+        for (idx, ch) in line.enumerated() {
+            if ch == "\"" { inString.toggle() }
+            if ch == "#" && !inString {
+                return String(line.prefix(idx))
+            }
+        }
+        return line
+    }
+
+    /// Splits a TOML inline array row on commas, ignoring commas inside quoted strings.
+    private func splitTOMLRow(_ s: String) -> [String] {
+        var parts: [String] = []
+        var current = ""
+        var inString = false
+        for ch in s {
+            if ch == "\"" { inString.toggle() }
+            if ch == "," && !inString {
+                parts.append(current)
+                current = ""
+            } else {
+                current.append(ch)
+            }
+        }
+        parts.append(current)
+        return parts
     }
 
     // MARK: - Errors

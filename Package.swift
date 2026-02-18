@@ -16,19 +16,13 @@ let package = Package(
             name: "F9Grid",
             targets: ["F9Grid"]),
     ],
-    dependencies: [
-        // Test-only dependency (not required for library users)
-        .package(url: "https://github.com/dduan/TOMLDecoder.git", from: "0.2.2"),
-    ],
+    dependencies: [],
     targets: [
         .target(
             name: "F9Grid",
             dependencies: []),
         .testTarget(
             name: "F9GridTests",
-            dependencies: [
-                "F9Grid",
-                .product(name: "TOMLDecoder", package: "TOMLDecoder"),
-            ]),
+            dependencies: ["F9Grid"]),
     ]
 )
